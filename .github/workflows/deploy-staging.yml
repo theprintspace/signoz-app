@@ -1,0 +1,176 @@
+name: Deploy to staging
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [staging]
+
+permissions:
+  contents: read
+  packages: write
+
+# Per-service deploy workflow for signoz-app (staging) — the SigNoz
+# all-in-one app image (UI + query service + alert manager).
+#
+# Builds Dockerfile (FROM signoz/signoz:v0.118.0 + USER root for volume
+# permissions), pushes to GHCR, deploys to Railway via inline GraphQL.
+#
+# Custom domain: signoz.staging.creativehub.io.
+# Volume: signoz-volume @ /var/lib/signoz (50GB, bootstrap-managed).
+# ClickHouse: tcp://clickhouse.railway.internal:9000 (internal DNS).
+#
+# Required setup:
+#   1. Repo secret OP_SERVICE_ACCOUNT_TOKEN — staging SA from Engineering vault.
+#   2. 1Password vault `tps-infra-staging`:
+#        railway/api-token, railway/project-id, railway/environment-id
+#        railway/services/signoz
+#        signoz/jwt-secret
+#        signoz/admin-password (env var SIGNOZ_USER_ROOT_PASSWORD)
+
+env:
+  IMAGE_REPO: ghcr.io/theprintspace/signoz-app
+  RAILWAY_GRAPHQL: https://backboard.railway.com/graphql/v2
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build + push image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_REPO }}:${{ github.sha }}
+            ${{ env.IMAGE_REPO }}:staging
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Install 1Password CLI
+        uses: 1password/install-cli-action@v1
+
+      - name: Load secrets from 1Password
+        env:
+          OP_SERVICE_ACCOUNT_TOKEN: ${{ secrets.OP_SERVICE_ACCOUNT_TOKEN }}
+        run: |
+          set -euo pipefail
+          VAULT='tps-infra-staging'
+
+          read_secret() {
+            local title="$1"
+            local val
+            val=$(op item get "$title" --vault "$VAULT" --fields password --reveal 2>/dev/null || true)
+            if [ -z "$val" ]; then
+              echo "::error::Required vault item '$title' missing or empty in $VAULT" >&2
+              return 1
+            fi
+            echo "$val"
+          }
+
+          RAILWAY_TOKEN=$(read_secret 'railway/api-token')
+          PROJECT_ID=$(read_secret 'railway/project-id')
+          ENVIRONMENT_ID=$(read_secret 'railway/environment-id')
+          SERVICE_ID=$(read_secret 'railway/services/signoz')
+          JWT_SECRET=$(read_secret 'signoz/jwt-secret')
+          ADMIN_PWD=$(read_secret 'signoz/admin-password')
+
+          for v in "$RAILWAY_TOKEN" "$JWT_SECRET" "$ADMIN_PWD"; do
+            echo "::add-mask::$v"
+          done
+
+          {
+            echo "RAILWAY_TOKEN=$RAILWAY_TOKEN"
+            echo "PROJECT_ID=$PROJECT_ID"
+            echo "ENVIRONMENT_ID=$ENVIRONMENT_ID"
+            echo "SERVICE_ID=$SERVICE_ID"
+            echo "JWT_SECRET=$JWT_SECRET"
+            echo "ADMIN_PWD=$ADMIN_PWD"
+          } >> "$GITHUB_ENV"
+
+      - name: Sync env vars to Railway
+        run: |
+          set -euo pipefail
+          # Mix of legacy + new SigNoz env-var conventions to cover v0.118.x
+          # bootstrap quirks. Adjust based on first-boot logs if needed.
+          ENVVARS=$(jq -nc \
+            --arg jwt "$JWT_SECRET" \
+            --arg pwd "$ADMIN_PWD" \
+            '{
+              STORAGE: "clickhouse",
+              ClickHouseUrl: "tcp://clickhouse.railway.internal:9000",
+              SIGNOZ_TELEMETRYSTORE_PROVIDER: "clickhouse",
+              SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_DSN: "tcp://clickhouse.railway.internal:9000",
+              SIGNOZ_AUTH_JWT_SECRET: $jwt,
+              SIGNOZ_USER_ROOT_PASSWORD: $pwd,
+              SIGNOZ_USER_ROOT_EMAIL: "admin@theprintspace.co.uk",
+              DEPLOYMENT_TYPE: "railway",
+              GODEBUG: "netdns=go"
+            }')
+
+          VARS_GQL=$(echo "$ENVVARS" | jq -r '
+            to_entries | map(
+              (.key | gsub("\""; "\\\"")) + ": " +
+              (.value | tojson)
+            ) | join(", ")
+          ')
+
+          body=$(jq -nc \
+            --arg pid "$PROJECT_ID" --arg eid "$ENVIRONMENT_ID" --arg sid "$SERVICE_ID" \
+            --arg vars "$VARS_GQL" \
+            '{query: "mutation { variableCollectionUpsert(input: { projectId: \"\($pid)\", environmentId: \"\($eid)\", serviceId: \"\($sid)\", replace: false, variables: { \($vars) } }) }"}')
+          response=$(curl -fsS -X POST "$RAILWAY_GRAPHQL" \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" -d "$body")
+          if echo "$response" | jq -e '.errors' > /dev/null 2>&1; then
+            echo "::error::variableCollectionUpsert: $(echo "$response" | jq -r '.errors[0].message')"
+            exit 1
+          fi
+          echo "::notice::Synced $(echo "$ENVVARS" | jq 'length') env vars"
+
+      - name: Update Railway service source + deploy
+        env:
+          IMAGE: ${{ env.IMAGE_REPO }}:${{ github.sha }}
+        run: |
+          set -euo pipefail
+          source_input=$(jq -nc --arg img "$IMAGE" '{image: $img}')
+          input_obj=$(jq -nc --argjson src "$source_input" '{source: $src}')
+          body=$(jq -nc \
+            --arg eid "$ENVIRONMENT_ID" --arg sid "$SERVICE_ID" \
+            --argjson input "$input_obj" \
+            '{
+              query: "mutation($eid: String!, $sid: String!, $input: ServiceInstanceUpdateInput!) { serviceInstanceUpdate(environmentId: $eid, serviceId: $sid, input: $input) }",
+              variables: { eid: $eid, sid: $sid, input: $input }
+            }')
+          response=$(curl -fsS -X POST "$RAILWAY_GRAPHQL" \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" -d "$body")
+          if echo "$response" | jq -e '.errors' > /dev/null 2>&1; then
+            echo "::error::serviceInstanceUpdate: $(echo "$response" | jq -r '.errors[0].message')"
+            exit 1
+          fi
+          echo "::notice::Updated source → $IMAGE"
+
+          body=$(jq -nc \
+            --arg eid "$ENVIRONMENT_ID" --arg sid "$SERVICE_ID" \
+            '{query: "mutation { serviceInstanceDeploy(environmentId: \"\($eid)\", serviceId: \"\($sid)\") }"}')
+          response=$(curl -fsS -X POST "$RAILWAY_GRAPHQL" \
+            -H "Authorization: Bearer $RAILWAY_TOKEN" \
+            -H "Content-Type: application/json" -d "$body")
+          if echo "$response" | jq -e '.errors' > /dev/null 2>&1; then
+            msg=$(echo "$response" | jq -r '.errors[0].message')
+            echo "::warning::serviceInstanceDeploy: $msg (likely already deploying)"
+          else
+            echo "::notice::Deploy triggered"
+          fi
