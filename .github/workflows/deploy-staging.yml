@@ -102,21 +102,35 @@ jobs:
       - name: Sync env vars to Railway
         run: |
           set -euo pipefail
-          # Mix of legacy + new SigNoz env-var conventions to cover v0.118.x
-          # bootstrap quirks. Adjust based on first-boot logs if needed.
+          # Env-var names sourced from the live dev SigNoz Railway service
+          # (project signoz / service signoz in TPS Projects workspace).
+          # Real names per v0.118.x:
+          #   SIGNOZ_TOKENIZER_JWT_SECRET — NOT SIGNOZ_AUTH_JWT_SECRET
+          #   FIRST_USER_PASSWORD / FIRST_USER_EMAIL — NOT SIGNOZ_USER_ROOT_*
+          #   ADMIN_PASSWORD / ADMIN_EMAIL — legacy aliases (set both for safety)
+          #   SIGNOZ_SQLSTORE_SQLITE_PATH — local app metadata DB
+          #   SIGNOZ_ALERTMANAGER_PROVIDER=signoz — built-in alertmanager
+          #   ALLOW_SIGNUP + several SELF_REGISTRATION variants — first-user setup
+          # NOT setting SIGNOZ_AUTH_DISABLE=true (dev disables auth; staging keeps
+          # auth on so signup at /signup creates an actual admin user).
           ENVVARS=$(jq -nc \
             --arg jwt "$JWT_SECRET" \
             --arg pwd "$ADMIN_PWD" \
             '{
-              STORAGE: "clickhouse",
-              ClickHouseUrl: "tcp://clickhouse.railway.internal:9000",
-              SIGNOZ_TELEMETRYSTORE_PROVIDER: "clickhouse",
+              SIGNOZ_TOKENIZER_JWT_SECRET: $jwt,
+              SIGNOZ_SQLSTORE_SQLITE_PATH: "/var/lib/signoz/signoz.db",
+              SIGNOZ_ALERTMANAGER_PROVIDER: "signoz",
               SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_DSN: "tcp://clickhouse.railway.internal:9000",
-              SIGNOZ_AUTH_JWT_SECRET: $jwt,
-              SIGNOZ_USER_ROOT_PASSWORD: $pwd,
-              SIGNOZ_USER_ROOT_EMAIL: "admin@theprintspace.co.uk",
-              DEPLOYMENT_TYPE: "railway",
-              GODEBUG: "netdns=go"
+              ALLOW_SIGNUP: "true",
+              ALLOW_SELF_REGISTRATION: "true",
+              SIGNOZ_ALLOW_SELF_REGISTRATION: "true",
+              SELF_REGISTRATION: "enabled",
+              "SIGNOZ__WEB__SELF_REGISTRATION_ENABLED": "true",
+              SIGNOZ_SELF_REGISTRATION_ENABLED: "true",
+              FIRST_USER_PASSWORD: $pwd,
+              FIRST_USER_EMAIL: "admin@theprintspace.co.uk",
+              ADMIN_PASSWORD: $pwd,
+              ADMIN_EMAIL: "admin@theprintspace.co.uk"
             }')
 
           VARS_GQL=$(echo "$ENVVARS" | jq -r '
