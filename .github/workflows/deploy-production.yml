@@ -70,8 +70,9 @@ jobs:
           SERVICE_ID=$(read_secret 'railway/services/signoz')
           JWT_SECRET=$(read_secret 'signoz/jwt-secret')
           ADMIN_PWD=$(read_secret 'signoz/admin-password')
+          RESEND_KEY=$(read_secret 'resend/api-token')
 
-          for v in "$RAILWAY_TOKEN" "$JWT_SECRET" "$ADMIN_PWD"; do
+          for v in "$RAILWAY_TOKEN" "$JWT_SECRET" "$ADMIN_PWD" "$RESEND_KEY"; do
             echo "::add-mask::$v"
           done
 
@@ -82,6 +83,7 @@ jobs:
             echo "SERVICE_ID=$SERVICE_ID"
             echo "JWT_SECRET=$JWT_SECRET"
             echo "ADMIN_PWD=$ADMIN_PWD"
+            echo "RESEND_KEY=$RESEND_KEY"
           } >> "$GITHUB_ENV"
 
       - name: Sync env vars to Railway
@@ -90,10 +92,15 @@ jobs:
           ENVVARS=$(jq -nc \
             --arg jwt "$JWT_SECRET" \
             --arg pwd "$ADMIN_PWD" \
+            --arg resend "$RESEND_KEY" \
             '{
               SIGNOZ_TOKENIZER_JWT_SECRET: $jwt,
               SIGNOZ_SQLSTORE_SQLITE_PATH: "/var/lib/signoz/signoz.db",
               SIGNOZ_ALERTMANAGER_PROVIDER: "signoz",
+              "SIGNOZ_ALERTMANAGER_SIGNOZ_GLOBAL_SMTP__SMARTHOST": "smtp.resend.com:587",
+              "SIGNOZ_ALERTMANAGER_SIGNOZ_GLOBAL_SMTP__FROM": "alerts@creativehub.io",
+              "SIGNOZ_ALERTMANAGER_SIGNOZ_GLOBAL_SMTP__AUTH__USERNAME": "resend",
+              "SIGNOZ_ALERTMANAGER_SIGNOZ_GLOBAL_SMTP__AUTH__PASSWORD": $resend,
               SIGNOZ_TELEMETRYSTORE_CLICKHOUSE_DSN: "tcp://clickhouse.railway.internal:9000",
               ALLOW_SIGNUP: "false",
               ALLOW_SELF_REGISTRATION: "false",
